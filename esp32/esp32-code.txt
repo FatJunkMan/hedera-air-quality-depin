@@ -1,0 +1,368 @@
+// Hedera Air Quality DePIN - Complete Sensor Station
+// ENS160+AHT21 + DSM501A PM Sensor + Hedera Integration
+// COPY&PASTE THIS CODE TO THE ARDUINO IDE
+#include <Wire.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include "ScioSense_ENS160.h"  // ENS160 library
+#include <Adafruit_AHTX0.h>     // AHT21 library
+
+// ========== CONFIGURATION ==========
+// WiFi credentials
+const char* ssid = "YOUR_SSID"; // WIFI NAME (2.4 GHZ)
+const char* password = "Hzm123456"; // WIFI PASSWORD
+
+// Backend server
+const char* serverUrl = "http://IPV4ADDRESS:3000/api/readings/submit";
+
+// Hedera account - FIXED!
+const char* ownerAccountId = "0.0.XXXXXXX";  // ACCOUNTID
+const char* ownerPrivateKey = "302e....."; // PRIVATE KEY
+const int sensorId = 1;
+
+// Pin Configuration
+#define DSM501A_PM25_PIN 25  // PM2.5 sensor
+#define DSM501A_PM10_PIN 26  // PM10 sensor
+#define SDA_PIN 21           // I2C Data
+#define SCL_PIN 22           // I2C Clock
+
+// Timing
+const unsigned long READING_INTERVAL = 300000;  // 5 minutes
+const unsigned long PM_SAMPLE_TIME = 30000;     // 30 seconds
+
+// Sensor objects
+ScioSense_ENS160 ens160(ENS160_I2CADDR_0);  // ENS160 at 0x53
+Adafruit_AHTX0 aht;                          // AHT21
+
+// Variables
+unsigned long lastReading = 0;
+int readingCount = 0;
+
+// ========== DATA STRUCTURE ==========
+struct SensorData {
+  float temperature;
+  float humidity;
+  uint16_t co2;
+  uint16_t tvoc;
+  uint16_t aqi;
+  float pm25;
+  float pm10;
+};
+
+// ========== SETUP ==========
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  
+  printHeader();
+  
+  // Initialize I2C
+  Wire.begin(SDA_PIN, SCL_PIN);
+  delay(100);
+  
+  // Initialize ENS160
+  Serial.println("🔧 Initializing ENS160...");
+  if (ens160.begin()) {
+    Serial.println("✓ ENS160 initialized");
+    ens160.setMode(ENS160_OPMODE_STD);
+  } else {
+    Serial.println("✗ ENS160 not found!");
+  }
+  
+  // Initialize AHT21
+  Serial.println("🔧 Initializing AHT21...");
+  if (aht.begin()) {
+    Serial.println("✓ AHT21 initialized");
+  } else {
+    Serial.println("✗ AHT21 not found!");
+  }
+  
+  // Initialize DSM501A
+  Serial.println("🔧 Initializing DSM501A...");
+  pinMode(DSM501A_PM25_PIN, INPUT);
+  pinMode(DSM501A_PM10_PIN, INPUT);
+  Serial.println("✓ DSM501A initialized");
+  Serial.println();
+  
+  // Connect WiFi
+  connectWiFi();
+  
+  Serial.println("⏱️  Warming up sensors (30 seconds)...");
+  delay(30000);
+  
+  Serial.println("✓ All systems ready!");
+  Serial.println("✓ Starting measurements...\n");
+}
+
+// ========== MAIN LOOP ==========
+void loop() {
+  unsigned long currentMillis = millis();
+  
+  if (currentMillis - lastReading >= READING_INTERVAL) {
+    lastReading = currentMillis;
+    readingCount++;
+    
+    Serial.println("╔═══════════════════════════════════════════╗");
+    Serial.printf("║  Reading #%-4d                            ║\n", readingCount);
+    Serial.println("╚═══════════════════════════════════════════╝");
+    Serial.println();
+    
+    // Read all sensors
+    SensorData data = readAllSensors();
+    
+    // Display results
+    displayResults(data);
+    
+    // Submit to Hedera
+    submitToHedera(data);
+    
+    Serial.println("═══════════════════════════════════════════\n");
+  }
+  
+  // Check WiFi
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("⚠️  WiFi disconnected. Reconnecting...");
+    connectWiFi();
+  }
+  
+  delay(1000);
+}
+
+// ========== READ ALL SENSORS ==========
+SensorData readAllSensors() {
+  SensorData data = {0};
+  
+  // Read AHT21 (Temperature & Humidity)
+  Serial.println("📊 Reading AHT21...");
+  sensors_event_t humidity_event, temp_event;
+  aht.getEvent(&humidity_event, &temp_event);
+  data.temperature = temp_event.temperature;
+  data.humidity = humidity_event.relative_humidity;
+  Serial.printf("  Temp: %.1f°C, Humidity: %.1f%%\n", data.temperature, data.humidity);
+  
+  // Read ENS160 (CO2, TVOC, AQI)
+  Serial.println("📊 Reading ENS160...");
+  if (ens160.available()) {
+    ens160.measure(true);
+    ens160.measureRaw(true);
+    
+    // Set temperature/humidity for compensation
+    ens160.set_envdata(data.temperature, data.humidity);
+    
+    data.co2 = ens160.geteCO2();
+    data.tvoc = ens160.getTVOC();
+    data.aqi = ens160.getAQI();
+    
+    Serial.printf("  CO2: %d ppm, TVOC: %d ppb, AQI: %d\n", 
+                  data.co2, data.tvoc, data.aqi);
+  } else {
+    Serial.println("  ✗ ENS160 not ready");
+  }
+  
+  // Read DSM501A (PM2.5 & PM10)
+  Serial.println("📊 Reading DSM501A (30 sec)...");
+  data.pm25 = readPM(DSM501A_PM25_PIN);
+  Serial.printf("  PM2.5: %.1f µg/m³\n", data.pm25);
+  
+  data.pm10 = readPM(DSM501A_PM10_PIN);
+  Serial.printf("  PM10: %.1f µg/m³\n", data.pm10);
+  Serial.println();
+  
+  return data;
+}
+
+// ========== READ PM SENSOR ==========
+float readPM(int pin) {
+  unsigned long duration;
+  unsigned long starttime = millis();
+  unsigned long lowpulseoccupancy = 0;
+  
+  while ((millis() - starttime) < PM_SAMPLE_TIME) {
+    duration = pulseIn(pin, LOW);
+    lowpulseoccupancy += duration;
+  }
+  
+  float ratio = lowpulseoccupancy / (PM_SAMPLE_TIME * 10.0);
+  float concentration = 0;
+  
+  if (ratio > 0 && ratio < 10) {
+    concentration = ratio * 0.5;
+  } else if (ratio >= 10) {
+    concentration = 1.1 * pow(ratio, 3) - 3.8 * pow(ratio, 2) + 520 * ratio + 0.62;
+  }
+  
+  return min(concentration, 500.0f);
+}
+
+// ========== DISPLAY RESULTS ==========
+void displayResults(SensorData data) {
+  Serial.println("📈 MEASUREMENT RESULTS");
+  Serial.println("═══════════════════════════════════════════");
+  Serial.println("🌡️  Temperature & Humidity:");
+  Serial.printf("   Temperature:  %.1f °C\n", data.temperature);
+  Serial.printf("   Humidity:     %.1f %%\n", data.humidity);
+  Serial.println();
+  
+  Serial.println("💨 Air Quality:");
+  Serial.printf("   CO2:          %d ppm\n", data.co2);
+  Serial.printf("   TVOC:         %d ppb\n", data.tvoc);
+  Serial.printf("   AQI:          %d\n", data.aqi);
+  Serial.println();
+  
+  Serial.println("🌫️  Particulate Matter:");
+  Serial.printf("   PM2.5:        %.1f µg/m³\n", data.pm25);
+  Serial.printf("   PM10:         %.1f µg/m³\n", data.pm10);
+  Serial.println("═══════════════════════════════════════════");
+  Serial.println();
+  
+  // Air quality assessment
+  assessAirQuality(data);
+}
+
+// ========== AIR QUALITY ASSESSMENT ==========
+void assessAirQuality(SensorData data) {
+  Serial.println("🎯 AIR QUALITY ASSESSMENT:");
+  Serial.println("───────────────────────────────────────────");
+  
+  // CO2 assessment
+  Serial.print("   CO2:    ");
+  if (data.co2 < 600) {
+    Serial.println("🟢 Excellent");
+  } else if (data.co2 < 1000) {
+    Serial.println("🟡 Good");
+  } else if (data.co2 < 1500) {
+    Serial.println("🟠 Fair");
+  } else {
+    Serial.println("🔴 Poor");
+  }
+  
+  // PM2.5 assessment
+  Serial.print("   PM2.5:  ");
+  if (data.pm25 < 12) {
+    Serial.println("🟢 Good");
+  } else if (data.pm25 < 35) {
+    Serial.println("🟡 Moderate");
+  } else if (data.pm25 < 55) {
+    Serial.println("🟠 Unhealthy (Sensitive)");
+  } else {
+    Serial.println("🔴 Unhealthy");
+  }
+  
+  // Overall AQI
+  Serial.print("   Overall: ");
+  if (data.aqi == 1) {
+    Serial.println("🟢 Excellent");
+  } else if (data.aqi == 2) {
+    Serial.println("🟢 Good");
+  } else if (data.aqi == 3) {
+    Serial.println("🟡 Moderate");
+  } else if (data.aqi == 4) {
+    Serial.println("🟠 Poor");
+  } else if (data.aqi == 5) {
+    Serial.println("🔴 Very Poor");
+  }
+  
+  Serial.println("───────────────────────────────────────────");
+  Serial.println();
+}
+
+// ========== SUBMIT TO HEDERA ==========
+void submitToHedera(SensorData data) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("✗ Cannot submit: No WiFi");
+    return;
+  }
+  
+  Serial.println("📤 Submitting to Hedera Network...");
+  
+  HTTPClient http;
+  http.begin(serverUrl);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(20000);
+  
+  // Create JSON payload
+  StaticJsonDocument<768> doc;
+  doc["ownerAccountId"] = ownerAccountId;
+  doc["ownerPrivateKey"] = ownerPrivateKey;
+  doc["sensorId"] = sensorId;
+  doc["co2Level"] = data.co2;
+  doc["pm25"] = (int)data.pm25;
+  
+  // Add extra data (optional - backend needs to handle these)
+  JsonObject extraData = doc.createNestedObject("extraData");
+  extraData["temperature"] = data.temperature;
+  extraData["humidity"] = data.humidity;
+  extraData["tvoc"] = data.tvoc;
+  extraData["aqi"] = data.aqi;
+  extraData["pm10"] = data.pm10;
+  
+  String jsonString;
+  serializeJson(doc, jsonString);
+  
+  // Send request
+  int httpResponseCode = http.POST(jsonString);
+  
+  if (httpResponseCode > 0) {
+    String response = http.getString();
+    Serial.printf("✓ HTTP Response: %d\n", httpResponseCode);
+    
+    StaticJsonDocument<512> responseDoc;
+    DeserializationError error = deserializeJson(responseDoc, response);
+    
+    if (!error && responseDoc["success"]) {
+      Serial.println("✓ Successfully submitted to Hedera!");
+      const char* txId = responseDoc["transactionId"];
+      if (txId) {
+        Serial.printf("✓ Transaction ID: %s\n", txId);
+        Serial.println("✓ View: https://hashscan.io/testnet");
+      }
+    } else {
+      Serial.println("✗ Submission failed");
+      Serial.println(response);
+    }
+  } else {
+    Serial.printf("✗ HTTP Error: %d\n", httpResponseCode);
+  }
+  
+  http.end();
+}
+
+// ========== WIFI CONNECTION ==========
+void connectWiFi() {
+  Serial.print("📡 Connecting to WiFi");
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println(" ✓");
+    Serial.print("✓ WiFi Connected! IP: ");
+    Serial.println(WiFi.localIP());
+    Serial.println();
+  } else {
+    Serial.println(" ✗");
+    Serial.println("✗ WiFi connection failed!");
+  }
+}
+
+// ========== HEADER ==========
+void printHeader() {
+  Serial.println("\n\n");
+  Serial.println("╔═══════════════════════════════════════════╗");
+  Serial.println("║   Hedera DePIN Air Quality Station       ║");
+  Serial.println("║   Multi-Sensor Environmental Monitor     ║");
+  Serial.println("╚═══════════════════════════════════════════╝");
+  Serial.println();
+  Serial.println("Sensors:");
+  Serial.println("  • ENS160  - CO2, TVOC, AQI");
+  Serial.println("  • AHT21   - Temperature, Humidity");
+  Serial.println("  • DSM501A - PM2.5, PM10");
+  Serial.println("═══════════════════════════════════════════");
+  Serial.println();
+}
