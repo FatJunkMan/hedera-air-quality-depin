@@ -616,11 +616,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - **Adafruit** for AHT21 sensor library
 - **Anthropic** for AI assistance in development
 
-## 📞 Contact
 
-- **GitHub**: [@yourusername](https://github.com/yourusername)
-- **Email**: your.email@example.com
-- **Project Link**: https://github.com/yourusername/hedera-air-quality-depin
 
 ## 🔗 Useful Links
 
